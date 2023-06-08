@@ -1,485 +1,1541 @@
-module Control(input wire clk, input wire rst, input wire [15:0]dBusIn, output reg [7:0]dBusOut, output reg rWMem, output wire [15:0]pcAddrBus, output wire [15:0]dataAddrBus, output reg [15:0]storeAddrBus);
-    //dBusIn (data bus in) fetch data from RAM
-    //dBusOut (data bus out) computed data sent out to RAM
-    //addrBus (address bus) controls in and out data from the RAM
-    //rWMem (read/write memory) rWMem=1 -> read, rWMem=0 -> write
-    //reg storeAddrBus, address to store data to (stb)
+`default_nettype none
 
-    assign pcAddrBus = pc;    //fetch next instruction
-    assign dataAddrBus = addressLine; //get data at address
-    
-    reg disablePc; //disables pc for multi cycle instructions
-    reg [1:0]disablePcCounter; //counter for number of cycles to wait for instruction to finish
-    reg [15:0]pc; //instruction pointer (program counter)
-    reg [15:0]stackPtr; //current stack pointer position
-    reg [15:0]addressLine; //get data @ RAM locaton
-    
-    reg eqFlagLatch;
-    reg flagLatch;
-    
-    wire [7:0]r1DataOut;
-    wire [7:0]r2DataOut;
-    wire [7:0]r3DataOut;
-    wire [7:0]r4DataOut; //reg line
-    
-    reg [7:0]tmpRegIn; //reg buffer in
-    reg [7:0]tmpRegOut; //reg buffer out
-    reg r1En, r2En, r3En, r4En; //write to reg
-    
-    wire flag; //alu flag
-    wire eqFlag; //alu eq flag
-    wire [7:0]acc; //acc reg (buffer to later send to r1 which is the actual acc)
-    
-    Alu alu(dBusIn[3:0], r1DataOut, tmpRegOut, acc, flag, eqFlag);
-    Register r1(tmpRegIn, r1DataOut, r1En);
-    Register r2(tmpRegIn, r2DataOut, r2En);
-    Register r3(tmpRegIn, r3DataOut, r3En);
-    Register r4(tmpRegIn, r4DataOut, r4En);
+module Control(input wire clk, 
+input wire rstIn, 
+output wire [23:0]pcOut, 
+input wire [7:0]instruction, 
+output wire [23:0]addressLinesOut, 
+output reg [1:0]memReadWrite, 
+output reg [7:0]toDataBus, 
+input wire [3:0]hardInterrupt, 
+input wire memException);
 
-    always @(posedge rst, posedge clk)
-    begin
-        if(rst)
-        begin
-            pc <= 0;
-            stackPtr <= 16'hFFFF; //point to top of memory
-            disablePc <= 0;
-            disablePcCounter <= 0;
-            rWMem <= 0;
-            
-            eqFlagLatch <= 0;
-            flagLatch <= 0;
-            
-            r1En <= 1;
-            r2En <= 1;
-            r3En <= 1;
-            r4En <= 1;
-            tmpRegIn = 8'h00;
-        end
-    
-        else
-        begin
-            rWMem <= 0;
-            r1En <= 0;
-            r2En <= 0;
-            r3En <= 0;
-            r4En <= 0;
-        
-            if(dBusIn[7] == 0)
-            begin
-                if(dBusIn[3:0] == 4'b1111) //extended special opcodes
-                begin
-                    if(dBusIn[4] == 0) //Push
-                    begin
-                        if(disablePc)
+	localparam DEFAULT_STACK_TOP_ADDRESS = 16'd3000; //after port out space
+	
+	localparam [1:0]
+		ADDR_MODE_RD = 2'b00,  //00 reads address lines (reading 'random' locations)
+		ADDR_MODE_PC = 2'b01,  //01 reads address at pc
+		ADDR_MODE_WRT = 2'b10; //10 writes to address lines
+
+	reg [7:0]instructionBuffer;
+	
+	assign pcOut = pc;
+	reg halt;
+	reg [24:0]nextPcBuffer; //hold the next pc address to go to, allows holding of pc value for multiple cycle instructions
+	reg [24:0]addressOutBuffer; //hold an address position to access, same as above allows multi cycle instructions to build buffer
+
+	reg disablePc; //stops PC when an instruction is not finished
+	reg [3:0]holdPcCnt; //cycles to hold PC
+
+	//-------------------------------MEMORY----------------------------------
+	reg [23:0]addressLines;
+	assign addressLinesOut = addressLines;
+
+	//reg memWrite;
+	//assign memWriteOut;
+	//-----------------------------------------------------------------------
+
+	//-------------------------------INTERRUPTS-------------------------------
+    //0 no interrupt
+    //1 non valid instruction
+    //2 div by 0
+    //3 general system fault
+    //4 memory exception
+
+	reg [23:0]iRetAddress;
+	wire activeIrq;
+	assign activeIrq = (hardInterrupt | interrupt) ? 1'b1 : 1'b0;
+	reg [3:0]interrupt; //internal hard int (e.g. illegal instructions, div by zero etc)
+	reg interruptRunning;
+	reg [23:0]interruptBufferQueue; //saves int type, and number
+	reg [23:0]currentInterruptVecAddr;
+	reg [24:0]intNextPcBuffer;
+	reg disableInt;
+	
+	//int. vec. table - copied into ram
+    //byte 0-3 address, byte 4 priority, byte 5 reserved, byte 6 reserved, byte 7 reserved (8 bytes total)
+	reg [7:0] interruptPriorityBuffer; //holds priority level
+	reg [7:0] currentIntPriority; //holds active int priority
+
+	//external hardware int pointers
+	parameter IRQ_1_ADDR = 24'd2000;
+	parameter IRQ_2_ADDR = 24'd2008;
+	parameter IRQ_3_ADDR = 24'd2016;
+	parameter IRQ_4_ADDR = 24'd2024;
+	parameter IRQ_5_ADDR = 24'd2032;
+	parameter IRQ_6_ADDR = 24'd2040;
+	parameter IRQ_7_ADDR = 24'd2048;
+	parameter IRQ_8_ADDR = 24'd2056;
+	parameter IRQ_9_ADDR = 24'd2064;
+	parameter IRQ_10_ADDR = 24'd2072;
+	parameter IRQ_11_ADDR = 24'd2080;
+	parameter IRQ_12_ADDR = 24'd2088;
+	parameter IRQ_13_ADDR = 24'd2096;
+	parameter IRQ_14_ADDR = 24'd2104;
+	parameter IRQ_15_ADDR = 24'd2112;
+
+	//internal exception int pointers
+	parameter INT_1_ADDR = 24'd2120;
+	parameter INT_2_ADDR = 24'd2128;
+	parameter INT_3_ADDR = 24'd2136;
+	parameter INT_4_ADDR = 24'd2144;
+	parameter INT_5_ADDR = 24'd2152;
+	parameter INT_6_ADDR = 24'd2160;
+	parameter INT_7_ADDR = 24'd2168;
+	parameter INT_8_ADDR = 24'd2176;
+	parameter INT_9_ADDR = 24'd2184;
+	parameter INT_10_ADDR = 24'd2192;
+	parameter INT_11_ADDR = 24'd2200;
+	parameter INT_12_ADDR = 24'd2208;
+	parameter INT_13_ADDR = 24'd2216;
+	parameter INT_14_ADDR = 24'd2224;
+	parameter INT_15_ADDR = 24'd2232;
+	
+	//software int call pointers
+	parameter SOFT_INT_16_ADDR = 24'd2240;
+	parameter SOFT_INT_17_ADDR = 24'd2248;
+	parameter SOFT_INT_18_ADDR = 24'd2256;
+	parameter SOFT_INT_19_ADDR = 24'd2264;
+	parameter SOFT_INT_20_ADDR = 24'd2272;
+	parameter SOFT_INT_21_ADDR = 24'd2280;
+	parameter SOFT_INT_22_ADDR = 24'd2288;
+
+	//parameter EXCEPTION_HNDLR = 24'd2112;
+	//-----------------------------------------------------------------------
+
+	//-------------------------------REGISTERS-------------------------------
+	reg r1En, r2En, r3En, r4En; //enables writing data to registers
+	//reg spEn;
+	reg flag; //flag for alu zero and cmp reg1 >
+	reg eqFlag; //flag for alu equal
+	reg [7:0]flagBuffer; //holds flags after restoring state of CPU after a call or int.
+	
+	reg [23:0]pc;
+	
+	//bus connecting data into registers
+	reg [7:0]regDataBusIn;
+	reg [7:0]spDataBusIn;
+	wire eqFlagBus;
+	wire flagBus;
+	wire divZero;
+	
+	//bus connecting data out of registers
+	wire [7:0]r1DataBusOut;
+	wire [7:0]r2DataBusOut;
+	wire [7:0]r3DataBusOut;
+	wire [7:0]r4DataBusOut;
+	
+	reg [7:0]regSwapBuffer;
+	
+	//declare registers
+	Register r1(.clk(clk), .rst(rst), .dataIn(regDataBusIn), .dataOut(r1DataBusOut), .en(r1En));
+	Register r2(.clk(clk), .rst(rst), .dataIn(regDataBusIn), .dataOut(r2DataBusOut), .en(r2En));
+	Register r3(.clk(clk), .rst(rst), .dataIn(regDataBusIn), .dataOut(r3DataBusOut), .en(r3En));
+	Register r4(.clk(clk), .rst(rst), .dataIn(regDataBusIn), .dataOut(r4DataBusOut), .en(r4En));
+	
+	reg [23:0]indexRegister;
+	reg [23:0]destinationRegister;
+	
+	reg [23:0]stackTopReg;
+	reg [23:0]stackPointer;
+
+	wire [7:0]aluToAccum;
+	reg [7:0]aluReg;
+	reg [7:0]aluOpcode;
+	//-----------------------------------------------------------------------
+
+	//			opcode				r1->ALU			r2->ALU		 ALU->accumulator		flag	flag
+	Alu alu(aluOpcode[3:0], r1DataBusOut, aluReg, aluToAccum, flagBus, eqFlagBus, divZero);
+	//IO io(.pc(pc), .instruction(instruction), .addressLinesIn(addressLines), .memWrite(memWrite), .dataBusIn(toDataBus), .dataBusOut(fromDataBus));
+	
+	reg rstInstruction;
+	wire rst;
+	assign rst = rstIn | rstInstruction;
+
+	always @(posedge clk)
+	begin
+		if(rst)
+		begin
+			rstInstruction <= 0;
+			r1En <= 0;
+			r2En <= 0;
+			r3En <= 0;
+			r4En <= 0;
+			
+			stackTopReg <= DEFAULT_STACK_TOP_ADDRESS;
+
+			aluOpcode <= 0;
+			aluReg <= 0;
+			eqFlag <= 0;
+			flag <= 0;
+			//aluTmpReg <= 0;
+			
+			destinationRegister <= 0;
+			indexRegister <= 0;
+			stackPointer <= DEFAULT_STACK_TOP_ADDRESS;
+			memReadWrite <= ADDR_MODE_RD; //default mode read next PC pointer
+			addressLines <= 0;
+
+			instructionBuffer <= 0;
+			halt <= 0;
+			pc <= 0;
+			disablePc <= 0;
+			holdPcCnt <= 0;
+			nextPcBuffer <= 0;
+			toDataBus <= 0;
+			
+			currentIntPriority <= 0;
+			interruptBufferQueue <= 0;
+			interruptRunning <= 0;
+			interrupt <= 0;
+			disableInt <= 0;
+			iRetAddress <= 0;
+		end
+	
+		else //clock edge
+		begin
+			if(halt == 1'b0)
+			begin
+				/*By setting disablePc adds an extra clock cycle to instructions,
+				*adding to holdPcCnt adds additional cycles to an instruction
+				*/
+				if(disablePc == 1) //PC disabled
+				begin
+					if(holdPcCnt > 0)
+						holdPcCnt <= holdPcCnt - 1;
+				
+					else
+					begin
+						disablePc <= 0;
+						pc <= nextPcBuffer;
+                        memReadWrite <= ADDR_MODE_PC;
+                        addressLines <= nextPcBuffer;
+					end
+					
+					//Handle multi-cycle instructions
+					if(instructionBuffer[7] == 1'b1) //ALU
+					begin
+						eqFlag <= eqFlagBus;
+						flag <= flagBus;
+					
+						//if(holdPcCnt)
+						//begin
+
+						//end
+
+						if(holdPcCnt == 0)
+						begin
+							r1En <= 0;
+						end
+
+						if(instructionBuffer == 8'b1000_0000  //OR
+						|| instructionBuffer == 8'b1000_0001  //AND
+						|| instructionBuffer == 8'b1000_0100  //CMP
+						|| instructionBuffer == 8'b1000_0110  //XOR
+						|| instructionBuffer == 8'b1000_0111  //ADD
+						|| instructionBuffer == 8'b1000_1000) //SUB
+						begin
+							if(holdPcCnt == 1)
+							begin
+								case(instruction[1:0])			
+									2'b00:
+										aluReg <= r1DataBusOut;
+										
+									2'b01:
+										aluReg <= r2DataBusOut;
+										
+									2'b10:
+										aluReg <= r3DataBusOut;
+										
+									2'b11:
+										aluReg <= r4DataBusOut;
+								endcase
+
+								regDataBusIn <= aluToAccum;
+								r1En <= 1;
+							end
+						end
+
+						else if(instructionBuffer == 8'b1000_0010  //SHL
+							 || instructionBuffer == 8'b1000_0011  //SHR
+							 || instructionBuffer == 8'b1000_0101  //NOT
+							 || instructionBuffer == 8'b1000_1001  //INC
+							 || instructionBuffer == 8'b1000_1010  //DEC
+							 || instructionBuffer == 8'b1000_1011  //ROL
+							 || instructionBuffer == 8'b1000_1100) //ROR
+						begin
+							regDataBusIn <= aluToAccum;
+							r1En <= 1;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_0001) //MOV
+					begin
+                        if(holdPcCnt == 2)
                         begin
-                            pc <= pc + 1;
-                            disablePc <= 0;
-                            stackPtr <= stackPtr - 1;
-                            
-                            storeAddrBus <= stackPtr;
-                            case(dBusIn[6:5]) //reg to push 0_xx_#1_111     xx = r1, r2, r3, r4
-                                2'b00:
-                                    dBusOut <= r1DataOut;
-                                2'b01:
-                                    dBusOut <= r2DataOut;
-                                2'b10:
-                                    dBusOut <= r3DataOut;
-                                2'b11:
-                                    dBusOut <= r4DataOut;
-                            endcase
-                        end //of disablePc
-                        
-                        disablePcCounter <= disablePcCounter + 1;
-                        disablePc <= 1;
-
-                        rWMem <= 1;
-                    end //of Push
-                    
-                    else if(dBusIn[4] == 1) //Pop
-                    begin
-                        if(disablePc)
-                        begin
-                            pc <= pc + 1;
-                            disablePc <= 0;
-                            stackPtr <= stackPtr + 1;
-                            //addressLine <= stackPtr; //get data off of stack
-                            
-                            case(dBusIn[6:5]) //reg to pop in
-                            2'b00:
-                                r1En <= 1;
-                            2'b01:
-                                r2En <= 1;
-                            2'b10:
-                                r3En <= 1;
-                            2'b11:
-                                r4En <= 1;
-                        endcase
+								//data being stored into
+								case(instruction[3:2])			
+									2'b00:
+										r1En <= 1;
+										
+									2'b01:
+										r2En <= 1;
+										
+									2'b10:
+										r3En <= 1;
+										
+									2'b11:
+										r4En <= 1;
+								endcase
+								
+								//data coming from
+								case(instruction[1:0])
+									2'b00:
+										regDataBusIn <= r1DataBusOut;
+										
+									2'b01:
+										regDataBusIn <= r2DataBusOut;
+										
+									2'b10:
+										regDataBusIn <= r3DataBusOut;
+										
+									2'b11:
+										regDataBusIn <= r4DataBusOut;
+								endcase
                         end
-                            
-                        tmpRegIn <= dBusIn[15:8];
-                        disablePc <= 1;
-                        disablePcCounter <= disablePcCounter + 1;
-                        
-                    end //of Pop
-                end //of if extended special opcodes
-                    
-                else if(dBusIn[3:0] == 4'b0111 && dBusIn[6] == 1) //other extended
-                begin
-                    if(dBusIn[4] == 0) //lodbmem
-                    begin
-                        if(disablePc)
+
+                        else if(holdPcCnt == 0)
                         begin
-                            pc <= pc + 1;
-                            disablePc <= 0;
-                            
-                                case(dBusIn[5]) //reg to load to
-                                1'b0:
-                                    r1En <= 1;
-                                1'b1:
-                                    r2En <= 1;
-                            endcase
+                            r1En <= 0;
+                            r2En <= 0;
+                            r3En <= 0;
+                            r4En <= 0;
                         end
-                        
-                        disablePc <= 1;
-                        disablePcCounter <= disablePcCounter + 1;
-                        tmpRegIn <= dBusIn[15:8];
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_0010) //LODSB
+					begin					
+						if(holdPcCnt == 2)
+						begin
+							r1En <= 1;
+							regDataBusIn <= instruction;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							r1En <= 0;
+							indexRegister <= indexRegister + 1;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_0011) //LOD (immediate values)		
+					begin										
+						if(holdPcCnt == 2)
+						begin
+							regDataBusIn <= instruction;
+							case(instructionBuffer[4:3])
+								2'b00:
+									r1En <= 1;
+										
+								2'b01:
+									r2En <= 1;
+										
+								2'b10:
+									r3En <= 1;
+									
+								2'b11:
+									r4En <= 1;
+							endcase	
+						end
+						
+						else if(holdPcCnt == 0)
+						begin
+							r1En <= 0;
+							r2En <= 0;
+							r3En <= 0;
+							r4En <= 0;			
+						end
+					end
+
+                    else if(instructionBuffer[7:0] == 8'b0000_0100) //STB
+                    begin
+						if(holdPcCnt == 4) //LSB
+						begin
+                            addressLines <= pc + 2;
+                            addressOutBuffer <= {16'h0000, instruction};
+						end
+						
+						else if(holdPcCnt == 3)
+						begin
+                            addressLines <= pc + 3;
+                            addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+                            addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+
+                        else if(holdPcCnt == 1)
+                        begin
+                            addressLines <= addressOutBuffer;
+                            memReadWrite <= ADDR_MODE_WRT;
+							toDataBus <= r1DataBusOut;
+                        end
                     end
-                    
-                    //else(dBusIn[4] == 1)
-                    //begin
-                    
-                    //end
-                end
-                    
-                    //int, runs when int line high or soft int activated
-                    //hardware int read int line input bits for type of int
-                    //software int read byte stored in r1
-                    //push all reg, including pc
-                    //goto int routine
-                    //restore and pop pc and regs off stack
-                    //resume task
-                    
-                    //3'b110: //far jmp, 2 cpu cycles
-                    //begin
-                    //    disablePc <= 1;
-                    //    disablePcCounter <= disablePcCounter + 1;
-                        
-                        //get high and low byte for jmp
-                        
-                    //    if(disablePcCounter > 1)
-                    //    begin
-                    //        disablePc <= 0;
-                    //        disablePcCounter <= 0;
-                            //pc <= {highDBusIn + lowDBusIn}
-                    //    end
-                    //end
-                //endcase
-                
-                
-                
-                
-            
-                else //regular opcodes
-                begin
-                    case(dBusIn[2:0])
-                        3'b000: //nop, 1 cpu cycle
-                        begin
-                            pc <= pc + 1;
-                        end
-                        
-                        3'b001: //mov, 1 cpu cycle
-                        begin
-                            //from
-                            case(dBusIn[4:3])
-                                2'b00:
-                                    tmpRegIn <= r1DataOut;
-                                2'b01:
-                                    tmpRegIn <= r2DataOut;
-                                2'b10:
-                                    tmpRegIn <= r3DataOut;
-                                2'b11:
-                                    tmpRegIn <= r4DataOut;
-                            endcase
-                            
-                            //to
-                            case(dBusIn[6:5])
-                                2'b00:
-                                    r1En <= 1;
-                                2'b01:
-                                    r2En <= 1;
-                                2'b10:
-                                    r3En <= 1;
-                                2'b11:
-                                    r4En <= 1;
-                            endcase
-                        
-                            pc <= pc + 1;
-                        end
-                        
-                        3'b010: //jmp to address, 2 cpu cycls (jmp)
-                        begin
-                            //add two's compl. of how far to jmp back or forward
-                            //pc + - goto = new PC location
-                            if(disablePc == 0)
-                            begin
-                                pc <= pc + {{8'hFF}, {dBusIn[15:8]}}; //sign extend 2's comp. 8-bit jmp
-                                disablePc <= 0;
-                            end
-                            
-                            disablePc <= 1;
-                            disablePcCounter <= disablePcCounter + 1;
-                            //addressLine <= pc + 1;
-                        end
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                        
-                        //ADD CHOICE OF REGISTER TO LOAD IMM. VALUES INTO FOR LODB
-                        //LIKE LODBMEM
-                        
-                        3'b011: //lodb, 2 cpu cycles (lodb $)
-                        begin
-                            if(disablePc)
-                            begin
-                                pc <= pc + 2;
-                                disablePc <= 0;
-                            end
-                            
-                                case(dBusIn[4:3])
-                                    2'b00:
-                                        r1En <= 1;
-                                    2'b01:
-                                        r2En <= 1;
-                                    2'b10:
-                                        r3En <= 1;
-                                    2'b11:
-                                        r4En <= 1;
-                                endcase
-                                
-                            disablePc <= 1;
-                            disablePcCounter <= disablePcCounter + 1;
-                            addressLine <= pc + 1; //get data @ next address
-                            tmpRegIn <= dBusIn[15:8];
-                        end
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        //--------------------------
-                        //add a lodb and stb to address 16 bit locations
-                        //by adding a r1+r2 => 16 bit addr
-                        //--------------------------
-                        
-                        3'b100: //stb, 2 cpu cycles (stb regAddr, regData)
-                        begin
-                            if(disablePc)
-                            begin
-                                pc <= pc + 1;
-                                disablePc <= 0;
-                                
-                                case(dBusIn[6:5]) //address to store
-                                    2'b00:
-                                        storeAddrBus <= r1DataOut;
-                                    2'b01:
-                                        storeAddrBus <= r2DataOut;
-                                    2'b10:
-                                        storeAddrBus <= r3DataOut;
-                                    2'b11:
-                                        storeAddrBus <= r4DataOut;
-                                endcase
-                                
-                                case(dBusIn[4:3]) //data to store
-                                    2'b00:
-                                        dBusOut <= r1DataOut;
-                                    2'b01:
-                                        dBusOut <= r2DataOut;
-                                    2'b10:
-                                        dBusOut <= r3DataOut;
-                                    2'b11:
-                                        dBusOut <= r4DataOut;
-                                endcase
-                            end //of disablePc
-                            
-                            disablePcCounter <= disablePcCounter + 1;
-                            disablePc <= 1;
 
-                            rWMem <= 1;
-                            //pc <= pc + 1;
-                        end //of stb
-                        
-                        3'b101: //bne, 2 cpu cycles
-                        begin
-                            if(eqFlagLatch == 0)
-                            begin
-                                if(disablePcCounter >= 1)
-                                begin
-                                    disablePc <= 0;
-                                    pc <= dBusIn[15:8];
-                                    eqFlagLatch <= 0;
-                                end
-                                
-                                disablePc <= 1;
-                                disablePcCounter <= disablePcCounter + 1;
-                                addressLine <= pc + 1;
-                            end
-                            
-                            else //if they are equal then go to next opcode, which is 2 bytes
-                                pc <= pc + 2;
-                        end //of bne
-                        
-                        3'b110: //beq, 2 cpu cycles
-                        begin
-                            if(eqFlagLatch)
-                            begin
-                                if(disablePcCounter >= 1)
-                                begin
-                                    disablePc <= 0;
-                                    pc <= dBusIn[15:8];
-                                    eqFlagLatch <= 0;
-                                end
-                                
-                                disablePc <= 1;
-                                disablePcCounter <= disablePcCounter + 1;
-                                addressLine <= pc + 1;
-                            end
-                            
-                            else
-                                pc <= pc + 2; //if they aren't equal go to next opcode, which is 2 bytes (see previous)
-                        end //of beq
-                        
-                        
-                        3'b111: //bgr, 2 cpu cycles (branch on r1 greater than
-                        begin
-                            if(flagLatch)
-                            begin
-                                if(disablePcCounter >= 1)
-                                begin
-                                    disablePc <= 0;
-                                    pc <= dBusIn[15:8];
-                                    flagLatch <= 0;
-                                end
-                                
-                                disablePc <= 1;
-                                disablePcCounter <= disablePcCounter + 1;
-                                addressLine <= pc + 1;
-                            end
-                            
-                            else
-                                pc <= pc + 2; //if they aren't equal go to next opcode, which is 2 bytes (see previous)
-                        end //of bgr
-                    endcase //of case opcodes
-                end //of else if regular opcodes
-            end //of dBusIn[7] == 0
-            
-            else if(dBusIn[7] == 1) //alu  ??????? IS ALU 2 INSTRUCTION CYCLES????????
-            begin
-                pc <= pc + 1;
-                tmpRegIn <= acc;
-                
-                if(dBusIn[3:0] == 4'b0100) //cmp instruction, so don't copy data into r1
-                begin
-                    r1En <= 0;
-                end
-                
-                else
-                begin
-                    r1En <= 1;
-                end
-                
-                
-                
-                //if(disablePc)
-                //begin
-                  //  disablePcCounter <= 0;
-                   // pc <= pc + 1;
-                //end
-                
-                //disablePc <= 1;
-                //disablePcCounter <= disablePcCounter + 1;
-                
-                
-            end //of dBusIn[7] == 1
-            
-            
-        end
-    end
-    
-    always @*
-    begin
-        if(eqFlag)
-            eqFlagLatch = 1;
-            
-        if(flag)
-            flagLatch = 1;
-    
-        //if(dBusIn[7] == 0 && dBusIn[2:0] == 3'b100) //stb
-        //begin
-          //  if(disablePcCounter > 1)
-           // begin
-             //   case(dBusIn[6:5])
-               //     2'b00:
-                 //       addressLine = {{8'h00}, r1DataOut};
-                  //  2'b01:
-                    //    addressLine = {{8'h00}, r2DataOut};
-                   // 2'b10:
-                     //   addressLine = {{8'h00}, r3DataOut};
-                    //2'b11:
-                      //  addressLine = {{8'h00}, r4DataOut};
-                //endcase
-            //end
-        //end
-            
-        //else
-        
-        if(dBusIn[4:0] == 5'b1_1111) //pop opcode (special case)
-            addressLine <= stackPtr + 1; //get data off of stack
-        else if(dBusIn[4:0] == 5'b0_0111 && dBusIn[6] == 1) //lodbmem (special case))
-            addressLine <= {r1DataOut, r2DataOut}; //get data @ next address
-        else
-            addressLine <= pc + 1; //otherwise fetch data at next address (general opcodes)
-        
-        if(disablePcCounter >= 2)
-        begin
-            disablePcCounter = 0;
-            disablePc = 0;
-        end
-        
-        if(dBusIn[7] == 1) //alu, connects registers to ALU input to be selectable
-        begin
+					else if(instructionBuffer[7:0] == 8'b0000_0101) //BNE
+					begin									
+						if(holdPcCnt == 3)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
 
-            
-            case(dBusIn[6:5])
-                2'b00:
-                    tmpRegOut = r1DataOut;
-                 
-                2'b01:
-                    tmpRegOut = r2DataOut;
-                    
-                2'b10:
-                    tmpRegOut = r3DataOut;
-                    
-                2'b11:
-                    tmpRegOut = r4DataOut;
-            endcase
-        end
-    end
+						else if(holdPcCnt == 1)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+							nextPcBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_0110) //BEQ
+					begin									
+						if(holdPcCnt == 3)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+							nextPcBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_0111) //BGR
+					begin									
+						if(holdPcCnt == 3)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+							nextPcBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_1111) //PUSH
+					begin
+						if(holdPcCnt == 1)
+						begin
+								addressLines <= stackPointer;
+								memReadWrite <= ADDR_MODE_WRT;
+
+								if(instruction[1:0] == 2'b00)
+									toDataBus <= r1DataBusOut;
+
+								else if(instruction[1:0] == 2'b01)
+									toDataBus <= r2DataBusOut;
+
+								else if(instruction[1:0] == 2'b10)
+									toDataBus <= r3DataBusOut;
+
+								else if(instruction[1:0] == 2'b11)
+									toDataBus <= r4DataBusOut;	
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							stackPointer <= stackPointer - 1;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0001_1111) //POP
+					begin
+						if(holdPcCnt == 2)
+						begin
+							addressLines <= stackPointer;
+
+							if(instruction[1:0] == 2'b00)
+								r1En <= 1;
+
+							else if(instruction[1:0] == 2'b01)
+								r2En <= 1;
+
+							else if(instruction[1:0] == 2'b10)
+								r3En <= 1;
+
+							else if(instruction[1:0] == 2'b11)
+								r4En <= 1;
+						end
+							
+						else if(holdPcCnt == 1)
+						begin
+							regDataBusIn <= instruction;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0100_0111) //LDM
+					begin
+						if(holdPcCnt == 5)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 4)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 3)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= addressOutBuffer;
+						end
+						
+						else if(holdPcCnt == 1)
+						begin
+							regDataBusIn <= instruction;
+							r1En <= 1;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_1000) //SOFTWARE INT
+					begin
+						if(holdPcCnt == 11)
+						begin
+							case(instruction)
+								8'h00:
+									addressLines <= SOFT_INT_16_ADDR - 8;
+
+								8'h01:
+									addressLines <= SOFT_INT_17_ADDR - 8;
+									
+								8'b010:
+									addressLines <= SOFT_INT_18_ADDR - 8;
+									
+								8'b011:
+									addressLines <= SOFT_INT_19_ADDR - 8;	
+									
+								8'b100:
+									addressLines <= SOFT_INT_20_ADDR - 8;
+									
+								8'b101:
+									addressLines <= SOFT_INT_21_ADDR - 8;
+									
+								8'b110:
+									addressLines <= SOFT_INT_22_ADDR - 8;		
+							endcase
+						end
+
+						else if(holdPcCnt == 10)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {16'h0000, instruction};
+						end
+
+						else if(holdPcCnt == 9)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {8'h00, instruction, nextPcBuffer[7:0]};
+						end
+					
+						else if(holdPcCnt == 8)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {instruction, nextPcBuffer[15:0]};
+						end
+
+						else if(holdPcCnt == 7)
+						begin
+							interruptPriorityBuffer <= instruction; //save priority
+						end
+
+                        else if(holdPcCnt == 6)
+                        begin
+                            flagBuffer <= {{6'b000000}, flag, eqFlag}; //save current flag state
+                            memReadWrite <= ADDR_MODE_WRT;
+                            addressLines <= stackPointer;
+                        end
+
+						                        //push flag states to stack
+                        else if(holdPcCnt == 5)
+                        begin
+                            toDataBus <= flagBuffer;
+                            stackPointer <= stackPointer - 1;
+                        end
+							//push flag states to stack
+						//	addressLines <= stackPointer;
+						//	memReadWrite <= ADDR_MODE_WRT;
+						//	stackPointer <= stackPointer - 1;
+						//	toDataBus <= flagBuffer;
+						//end
+
+                        //push int priority level to stack
+                        else if(holdPcCnt == 4)
+                        begin
+                            toDataBus <= interruptPriorityBuffer;
+                            stackPointer <= stackPointer - 1;
+                            intNextPcBuffer <= iRetAddress; //save current running int. PC (if there is one running)
+                        end
+
+                        //push iret to stack
+                        else if(holdPcCnt == 3)
+                        begin
+                            addressLines <= stackPointer;
+                            stackPointer <= stackPointer - 1;
+                            toDataBus <= iRetAddress[23:16];
+                        end
+
+                        else if(holdPcCnt == 2)
+                        begin
+                            addressLines <= stackPointer;
+                            stackPointer <= stackPointer - 1;
+                            toDataBus <= iRetAddress[15:8];
+                        end
+
+                        else if(holdPcCnt == 1)
+                        begin
+                            addressLines <= stackPointer;
+                            stackPointer <= stackPointer - 1;
+                            toDataBus <= iRetAddress[7:0];
+
+                            //no active int
+                            if(currentIntPriority == 0)
+                            begin
+                                interruptBufferQueue <= 0;
+                                currentIntPriority <= interruptPriorityBuffer;
+                            end
+
+                            else
+                            begin
+                                if(interruptPriorityBuffer > currentIntPriority)
+                                begin
+                                    currentIntPriority <= interruptPriorityBuffer;
+                                end
+                                
+                                else //this new int. has a lower or equal priority so save it for later
+                                begin
+                                    stackPointer <= stackPointer + 4;
+                                    interruptBufferQueue <= currentInterruptVecAddr; //save this int. execution to buffer
+                                    nextPcBuffer <= intNextPcBuffer; //set pc back to previous running int.
+                                end
+                            end
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+					end
+	
+					else if(instructionBuffer[7:0] == 8'b0111_1000) //IRET
+					begin
+						//pop address
+						if(holdPcCnt == 5)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer + 1;
+						end
+
+						if(holdPcCnt == 4)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer + 1;
+							nextPcBuffer <= {16'h0000, instruction};
+						end
+
+						else if(holdPcCnt == 3)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer + 1;
+							nextPcBuffer <= {8'h00, instruction, nextPcBuffer[7:0]};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							nextPcBuffer <= {instruction, nextPcBuffer[15:0]};
+							stackPointer <= stackPointer + 1; //pop int priority from stack
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							//recover flags
+							flag <= instruction[1];
+							eqFlag <= instruction[0];
+							interruptRunning <= 0;
+							currentIntPriority <= 0;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_1010) //PUSHA
+					begin
+						if(holdPcCnt == 7)
+						begin
+							toDataBus <= r1DataBusOut;
+						end
+
+						else if(holdPcCnt == 6)
+						begin
+							stackPointer <= stackPointer - 1;
+						end
+
+						else if(holdPcCnt == 5)
+						begin
+							addressLines <= stackPointer;
+							toDataBus <= r2DataBusOut;
+						end
+
+						else if(holdPcCnt == 4)
+						begin
+							stackPointer <= stackPointer - 1;
+						end
+
+						else if(holdPcCnt == 3)
+						begin
+							addressLines <= stackPointer;
+							toDataBus <= r3DataBusOut;
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							stackPointer <= stackPointer - 1;
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressLines <= stackPointer;
+							toDataBus <= r4DataBusOut;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							stackPointer <= stackPointer - 1;
+						end
+					end
+
+					else if(instructionBuffer[7:0] == 8'b0000_1011) //POPA
+					begin
+						if(holdPcCnt == 8)
+						begin
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 7)
+						begin
+							regDataBusIn <= instruction;
+							r4En <= 1;
+							stackPointer <= stackPointer + 1;
+						end
+
+						else if(holdPcCnt == 6)
+						begin
+							r4En <= 0;
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 5)
+						begin
+							regDataBusIn <= instruction;
+							r3En <= 1;
+							stackPointer <= stackPointer + 1;
+						end
+
+						else if(holdPcCnt == 4)
+						begin
+							r3En <= 0;
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 3)
+						begin
+							regDataBusIn <= instruction;
+							r2En <= 1;
+							stackPointer <= stackPointer + 1;
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							r2En <= 0;
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							regDataBusIn <= instruction;
+							r1En <= 1;
+						end
+
+						else if(holdPcCnt == 0) //r1 disabled by default at holdPcCnt 0
+						begin
+						end
+					end
+
+					else if(instructionBuffer == 8'b0010_1000) //CALL
+					begin
+						if(holdPcCnt == 6)
+						begin
+							addressLines <= pc + 2;
+							nextPcBuffer <= {16'h00, instruction};
+						end
+					
+						else if(holdPcCnt == 5)
+						begin
+							addressLines <= pc + 3;
+							nextPcBuffer <= {8'h00, instruction, nextPcBuffer[7:0]}; //call jump to address
+						end
+
+						else if(holdPcCnt == 4)
+						begin
+							nextPcBuffer <= {instruction, nextPcBuffer[15:0]};
+							addressLines <= stackPointer;
+							memReadWrite <= ADDR_MODE_WRT;
+						end
+
+ 						//push return address
+						else if(holdPcCnt == 3)
+						begin
+							//addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[23:16];
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[15:8];
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[7:0];
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+					end
+
+					else if(instructionBuffer == 8'b0010_0110) //RTS
+					begin
+						if(holdPcCnt == 6)
+						begin						
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 5)
+						begin
+							stackPointer <= stackPointer + 1;	
+							nextPcBuffer <= {16'h00, instruction};
+						end
+						
+						else if(holdPcCnt == 4)
+						begin
+							addressLines <= stackPointer;
+						end
+						
+						else if(holdPcCnt == 3)
+						begin
+							nextPcBuffer <= {8'h00, instruction, nextPcBuffer[7:0]};
+							stackPointer <= stackPointer + 1;
+						end
+					
+						if(holdPcCnt == 2)
+						begin
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							nextPcBuffer <= {instruction, nextPcBuffer[15:0]};
+							addressLines <= stackPointer;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+					end
+
+					else if(instructionBuffer == 8'b0100_1000) //BRA
+					begin
+						if(holdPcCnt == 3)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+							nextPcBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+					end
+
+					else if(instructionBuffer == 8'b0110_0000) //BRZ
+					begin									
+						if(holdPcCnt == 3)
+						begin
+							addressLines <= pc + 2;
+							addressOutBuffer <= {16'h0000, instruction};
+						end
+					
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 3;
+							addressOutBuffer <= {8'h00, instruction, addressOutBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressOutBuffer <= {instruction, addressOutBuffer[15:0]};
+							nextPcBuffer <= {instruction, addressOutBuffer[15:0]};
+						end
+					end
+
+					else if(instructionBuffer == 8'b0111_0000) //SPIR (set pointer index)
+					begin
+						if(holdPcCnt == 3)
+						begin
+							indexRegister <= {16'h00, instruction};
+                            addressLines <= pc + 2;
+						end
+						
+						else if(holdPcCnt == 2)
+						begin
+							indexRegister <= {8'h00, instruction, indexRegister[7:0]};
+							addressLines <= pc + 3;
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							indexRegister <= {instruction, indexRegister[15:0]};
+						end						
+					end
+
+					else if(instructionBuffer == 8'b0111_0010) //SBP
+					begin
+						if(holdPcCnt == 2)
+						begin
+							addressLines <= pc + 2;
+							stackTopReg <= {16'h00, instruction};
+						end
+						
+						else if(holdPcCnt == 1)
+						begin
+							addressLines <= pc + 3;
+							stackTopReg <= {8'h00, instruction, stackTopReg[7:0]};
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							stackTopReg <= {instruction, stackTopReg[15:0]};
+						end
+					end
+
+					else if(instructionBuffer == 8'b0011_0010) //STOSB
+					begin 
+						if(holdPcCnt == 2)
+						begin
+							addressLines <= destinationRegister;
+							toDataBus <= r1DataBusOut;
+							memReadWrite <= ADDR_MODE_WRT;
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+							destinationRegister <= destinationRegister + 1;
+						end
+					end
+
+					else if(instructionBuffer == 8'b0011_0011) //SPDR
+					begin
+						if(holdPcCnt == 3)
+						begin
+							destinationRegister <= {16'h00, instruction};
+							addressLines <= pc + 2;
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							destinationRegister <= {8'h00, instruction, destinationRegister[7:0]};
+							addressLines <= pc + 3;
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							destinationRegister <= {instruction, destinationRegister[15:0]};
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+					end
+
+					else if(instructionBuffer == 8'b0111_0011)//XCHG
+					begin
+						if(holdPcCnt == 4)
+						begin
+							case(instruction[1:0])
+							2'b00:
+								regSwapBuffer <= r1DataBusOut;
+								
+							2'b01:
+								regSwapBuffer <= r2DataBusOut;
+								
+							2'b10:
+								regSwapBuffer <= r3DataBusOut;
+
+							2'b11:
+								regSwapBuffer <= r4DataBusOut;										
+							endcase
+						end
+
+						else if(holdPcCnt == 3)
+						begin
+							regDataBusIn <= r1DataBusOut;
+							case(instruction[1:0])
+							2'b00:
+								r1En <= 1;
+							2'b01:
+								r2En <= 1;
+							2'b10:
+								r3En <= 1;
+							2'b11:
+								r4En <= 1;
+							endcase
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							 r1En <= 0;
+							 r2En <= 0;
+							 r3En <= 0;
+							 r4En <= 0;
+						end
+
+						else if(holdPcCnt == 1) //copy other reg to r1
+						begin
+							 regDataBusIn <= regSwapBuffer;
+							 r1En <= 1;
+						end
+					end
+
+                    else if(instructionBuffer == 8'b0111_1111) //HARDWARE INT
+                    begin
+						//set jump to address
+						if(holdPcCnt == 10)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {16'h0000, instruction};
+						end
+
+						else if(holdPcCnt == 9)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {8'h00, instruction, nextPcBuffer[7:0]};
+						end
+
+						else if(holdPcCnt == 8)
+						begin
+							addressLines <= addressLines + 1;
+							nextPcBuffer <= {instruction, nextPcBuffer[15:0]};
+						end
+
+						else if(holdPcCnt == 7)
+						begin
+							interruptPriorityBuffer <= instruction; 
+						end
+
+						else if(holdPcCnt == 6)
+						begin
+							flagBuffer <= {{6'b000000}, flag, eqFlag}; //save current flag state
+							memReadWrite <= ADDR_MODE_WRT;
+							addressLines <= stackPointer;
+						end
+
+						//push flag states to stack
+						else if(holdPcCnt == 5)
+						begin		
+							toDataBus <= flagBuffer;
+							stackPointer <= stackPointer - 1;
+						end
+
+						//push int priority level to stack
+						else if(holdPcCnt == 4)
+						begin
+							toDataBus <= interruptPriorityBuffer;
+							stackPointer <= stackPointer - 1;
+							intNextPcBuffer <= iRetAddress; //save current running int. PC (if there is one running)
+						end
+
+                        //push iret to stack
+						else if(holdPcCnt == 3)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[23:16];
+						end
+
+						else if(holdPcCnt == 2)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[15:8];
+						end
+
+						else if(holdPcCnt == 1)
+						begin
+							addressLines <= stackPointer;
+							stackPointer <= stackPointer - 1;
+							toDataBus <= iRetAddress[7:0];
+
+							//no active int
+							if(currentIntPriority == 0)
+							begin
+								interruptBufferQueue <= 0;
+								currentIntPriority <= interruptPriorityBuffer;
+							end
+
+							else
+							begin
+								if(interruptPriorityBuffer > currentIntPriority)
+								begin
+									currentIntPriority <= interruptPriorityBuffer;
+								end
+								
+								else //this new int. has a lower or equal priority so save it for later
+								begin
+									stackPointer <= stackPointer + 4;
+									interruptBufferQueue <= currentInterruptVecAddr; //save this int. execution to buffer
+									nextPcBuffer <= intNextPcBuffer; //set pc back to previous running int.
+								end
+							end
+						end
+
+						else if(holdPcCnt == 0)
+						begin
+						end
+                    end
+                end //end of disable PC
+				///////////////////////////////////
+				//END OF MULTI-CYCLE INSTRUCTIONS//
+				///////////////////////////////////
+
+				else //PC not disabled
+				begin
+					//interrupts/exceptions
+					if(interruptBufferQueue != 0 && interruptRunning == 0)
+					begin
+						currentInterruptVecAddr <= INT_1_ADDR + (interrupt * 8) - 8;
+						interruptRunning <= 1;
+						instructionBuffer <= 8'b0111_1111;
+						memReadWrite <= ADDR_MODE_RD;
+						addressLines <= interruptBufferQueue;
+						iRetAddress = nextPcBuffer;
+						disablePc <= 1;
+						holdPcCnt <= 10;
+					end
+
+					//should always trigger on exception interrupts (can't be blocked)
+					else if(interrupt == 8'd1 || interrupt == 8'd2 || interrupt == 8'd3 ||
+					interrupt == 8'd4)
+					begin
+						currentInterruptVecAddr <= INT_1_ADDR + (interrupt * 8) - 8;
+						interruptRunning <= 1;
+						instructionBuffer <= 8'b0111_1111;
+						memReadWrite <= ADDR_MODE_RD;
+						addressLines <= INT_1_ADDR + (interrupt * 8) - 8;
+						iRetAddress = nextPcBuffer;
+						disablePc <= 1;
+						holdPcCnt <= 10;
+					end
+
+					else if(activeIrq && disableInt == 1'b0 && interruptRunning == 0) //external interrupt pins
+					begin
+						currentInterruptVecAddr <= IRQ_1_ADDR + (hardInterrupt * 8) - 8;
+						interruptRunning <= 1;
+						instructionBuffer <= 8'b0111_1111;
+						memReadWrite <= ADDR_MODE_RD;
+						addressLines <= IRQ_1_ADDR + (hardInterrupt * 8) - 8;
+						iRetAddress = nextPcBuffer;
+						disablePc <= 1;
+						holdPcCnt <= 10;
+					end
+
+					//alu
+					else
+					begin
+						r1En <= 0;
+						r2En <= 0;
+						r3En <= 0;
+						r4En <= 0;
+						regDataBusIn <= 0;
+						pc <= nextPcBuffer;
+						instructionBuffer <= instruction;
+					
+						//alu instructions
+						if(instruction[7] == 1'b1)
+						begin
+							aluOpcode <= instruction; //hold alu opcode so instruction line can be used for new opperations
+
+							if(divZero == 1'b1)
+								interrupt <= 2; //exception 2
+
+							nextPcBuffer <= pc + 1;
+							disablePc <= 1;
+							holdPcCnt <= 3;
+
+							if(instruction == 8'b1000_0000  //OR
+							|| instruction == 8'b1000_0001  //AND
+							|| instruction == 8'b1000_0100  //CMP
+							|| instruction == 8'b1000_0110  //XOR
+							|| instruction == 8'b1000_0111  //ADD
+							|| instruction == 8'b1000_1000) //SUB
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 1;
+
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction == 8'b1000_0010  //SHL
+									|| instruction == 8'b1000_0011  //SHR
+									|| instruction == 8'b1000_0101  //NOT
+									|| instruction == 8'b1000_1001  //INC
+									|| instruction == 8'b1000_1010  //DEC
+									|| instruction == 8'b1000_1011  //ROL
+									|| instruction == 8'b1000_1100) //ROR
+							begin
+								nextPcBuffer <= pc + 1;
+								disablePc <= 1;
+								holdPcCnt <= 0;
+							end						
+						end
+						
+						//all non-alu instructions
+						else
+						begin
+							if(instruction[7:0] == 8'b0000_0000) //NOP
+							begin
+								nextPcBuffer <= pc + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0001) //MOV
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0010) //LODSB
+							begin
+								nextPcBuffer <= pc + 1;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+								
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= indexRegister;
+							end
+							
+							else if(instruction[7:0] == 8'b0000_0011) //LOD (immediate values)
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0100) //STB
+							begin
+								nextPcBuffer <= pc + 4;
+								disablePc <= 1;
+								holdPcCnt <= 4;
+								
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0101) //BNE
+							begin                                
+								if(eqFlag == 0)
+								begin
+									disablePc <= 1;
+									holdPcCnt <= 3;
+									memReadWrite <= ADDR_MODE_RD;
+									addressLines <= pc + 1;
+								end
+									
+								else
+									nextPcBuffer <= pc + 4;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0110) //BEQ
+							begin
+								if(eqFlag)
+								begin
+									disablePc <= 1;
+									holdPcCnt <= 3;
+									memReadWrite <= ADDR_MODE_RD;
+									addressLines <= pc + 1;
+								end
+
+								else
+									nextPcBuffer <= pc + 4;
+							end
+
+							else if(instruction[7:0] == 8'b0000_0111) //BGR
+							begin                    
+								if(flag) //r1 > r2
+								begin
+									disablePc <= 1;
+									holdPcCnt <= 3;
+									memReadWrite <= ADDR_MODE_RD;
+									addressLines <= pc + 1;
+								end
+
+								else
+									nextPcBuffer <= pc + 4;
+							end
+
+							else if(instruction[7:0] == 8'b0000_1111) //PUSH
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;			
+							end
+							
+							else if(instruction[7:0] == 8'b0001_1111) //POP
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+								stackPointer <= stackPointer + 1;
+							end
+									
+							else if(instruction[7:0] == 8'b0100_0111) //LDM
+							begin
+								nextPcBuffer <= pc + 4;
+								disablePc <= 1;
+								holdPcCnt <= 5;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;		
+							end
+
+							else if(instruction[7:0] == 8'b0000_1000) //INT
+							begin
+								interruptRunning <= 1;
+								flagBuffer <= {{6'b000000}, flag, eqFlag}; //save current flag state
+								disablePc <= 1;
+								holdPcCnt <= 11;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;	
+								iRetAddress <= pc + 2;
+							end
+
+							else if(instruction[7:0] == 8'b0111_1000) //IRET
+							begin
+								nextPcBuffer <= pc + 1;
+								disablePc <= 1;
+								holdPcCnt <= 5;
+								memReadWrite <= ADDR_MODE_RD;
+								stackPointer <= stackPointer + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0000_1010) //PUSHA
+							begin
+								nextPcBuffer <= pc + 1;
+								disablePc <= 1;
+								holdPcCnt <= 7;
+								memReadWrite <= ADDR_MODE_WRT;
+								addressLines <= stackPointer;
+							end
+
+							else if(instruction[7:0] == 8'b0000_1011) //POPA
+							begin
+								nextPcBuffer <= pc + 1;
+								disablePc <= 1;
+								holdPcCnt <= 8;
+								memReadWrite <= ADDR_MODE_RD;
+								stackPointer <= stackPointer + 1;
+							end
+
+							else if(instruction[7:0] == 8'b0011_1110) //CLI
+							begin
+								nextPcBuffer <= pc + 1;
+								disableInt <= 1'b1;
+							end
+
+							else if(instruction[7:0] == 8'b0111_1110) //STI
+							begin
+								nextPcBuffer <= pc + 1;
+								disableInt <= 1'b0;
+							end
+
+							else if(instruction == 8'b0001_1000) //HALT
+							begin
+								halt <= 1;
+							end
+
+							else if(instruction == 8'b0010_1000) //CALL
+							begin
+								disablePc <= 1;
+								holdPcCnt <= 6;
+								
+								iRetAddress <= pc + 3;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;		
+							end
+
+							else if(instruction == 8'b0010_0110) //RTS
+							begin
+								disablePc <= 1;
+								holdPcCnt <= 6;
+											
+								stackPointer <= stackPointer + 1;
+								memReadWrite <= ADDR_MODE_RD;						
+							end
+
+							else if(instruction == 8'b0100_1000) //BRA
+							begin
+								disablePc <= 1;
+								holdPcCnt <= 3;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction == 8'b0100_0000) //NSB (new stack base)
+							begin
+								nextPcBuffer <= pc + 1;
+								stackPointer <= stackTopReg;		
+							end
+
+							else if(instruction == 8'b0110_0000) //BRZ
+							begin
+								if(flag)
+								begin
+									disablePc <= 1;
+									holdPcCnt <= 3;
+									memReadWrite <= ADDR_MODE_RD;
+									addressLines <= pc + 1;
+								end
+									
+								else
+									nextPcBuffer <= pc + 4;
+							end
+
+							else if(instruction == 8'b0111_0000) //SPIR (set pointer index)
+							begin
+								nextPcBuffer <= pc + 4;
+								disablePc <= 1;
+								holdPcCnt <= 3;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction == 8'b0111_0001) //RST (resets CPU)
+							begin
+								rstInstruction <= 1;
+							end
+
+							else if(instruction == 8'b0111_0010) //SBP
+							begin
+								nextPcBuffer <= pc + 3;
+								disablePc <= 1;
+								holdPcCnt <= 2;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction == 8'b0011_0010) //STOSB
+							begin
+								disablePc <= 1;
+								holdPcCnt <= 2;
+								nextPcBuffer <= pc + 1;
+							end
+
+							else if(instruction == 8'b0011_0011) //SPDR
+							begin
+								nextPcBuffer <= pc + 3;
+								disablePc <= 1;
+								holdPcCnt <= 3;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else if(instruction == 8'b0111_0011)//XCHG
+							begin
+								nextPcBuffer <= pc + 2;
+								disablePc <= 1;
+								holdPcCnt <= 4;
+								memReadWrite <= ADDR_MODE_RD;
+								addressLines <= pc + 1;
+							end
+
+							else //exception, not an instruction
+							begin
+								interrupt <= 1; //exception 1
+							end
+						end
+				end //end of pc not disabled
+            end //end of not halt
+        end //end of clk edge
+    end //end of always block
+end
 endmodule

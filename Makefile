@@ -1,4 +1,3 @@
 all:
-	iverilog test.v control.v alu.v register.v iointegratedMem.v
-	#iverilog testControl.v control.v alu.v register.v
+	iverilog Test.v ALU.v io.v Control.v Register.v
 	vvp a.out
