@@ -27,7 +27,11 @@ module Test;
 	reg clk;
 	reg rst;
 	wire beeper;
-	reg [3:0] hardInterrupt;
+	reg [3:0]hardInterrupt;
+	wire [7:0]debugStackbaf0;
+	wire [7:0]debugStackbaf1;
+	wire [7:0]debugStackbaf2;
+	wire [7:0]debugStackbaf3;
 
 	initial begin
 		forever
@@ -45,8 +49,12 @@ module Test;
 		.clk(clk), 
 		.rstIn(rst),
 		.beeper(beeper),
-		.hardInterrupt(hardInterrupt)
-	);
+		.hardInterrupt(hardInterrupt),
+		.debugStackbaf0(debugStackbaf0),
+		.debugStackbaf1(debugStackbaf1),
+		.debugStackbaf2(debugStackbaf2),
+		.debugStackbaf3(debugStackbaf3)
+		);
 	
 	// Inputs
 /*	reg clk;
@@ -117,9 +125,9 @@ module Test;
 		#100;
 		//hardInterrupt = 0;
 		#20;
-		hardInterrupt = 1;
+		//hardInterrupt = 1;
 		#20;
-		hardInterrupt = 0;
+		//hardInterrupt = 0;
 
 		#10000;
 	$finish;
